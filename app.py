@@ -1,4 +1,3 @@
-import cv2
 import logging
 import os
 import tempfile
@@ -27,29 +26,65 @@ def extract_pdf_fields(pdf_path):
                     field_value = annot_obj.get("/V")
                     field_type = annot_obj.get("/FT")
                     logging.debug(f"Annot Object: {annot_obj}")
-                    fields.append({"name": field_name, "value": field_value, "type": field_type})
-                    logging.debug(f"Extracted field: {{'name': {field_name}, 'value': {field_value}, 'type': {field_type}}}")
+                    fields.append({
+                        "name": field_name,
+                        "value": field_value,
+                        "type": field_type,
+                        "page": page_num + 1  # Add page number here
+                    })
+                    logging.debug(f"Extracted field: {{'name': {field_name}, 'value': {field_value}, 'type': {field_type}, 'page': {page_num + 1}}}")
 
                     if field_type == "/Sig":
-                        signatures.append({"name": field_name, "signed": bool(field_value)})
-                        logging.debug(f"Extracted signature: {{'name': {field_name}, 'signed': {bool(field_value)}}}")
+                        signatures.append({
+                            "name": field_name,
+                            "signed": bool(field_value),
+                            "page": page_num + 1  # Add page number here
+                        })
+                        logging.debug(f"Extracted signature: {{'name': {field_name}, 'signed': {bool(field_value)}, 'page': {page_num + 1}}}")
     return fields, signatures
 
-def identify_and_validate_form(fields, signatures):
-    form_type = "RiskProfile"
-    
+def identify_form(fields):
+    # Check for unique fields in each form to identify the form type
+    fais_keywords = ["@FA Full name", "@CD Full name Not permitted", "@CD Full name Appoint"]
+    risk_profile_keywords = ["TOTAL SCORE", "Risk Tolerance", "Investment Term"]
+
+    fais_match = any(field['name'] in fais_keywords for field in fields)
+    risk_profile_match = any(field['name'] in risk_profile_keywords for field in fields)
+
+    if fais_match:
+        return "FAIS Letter"
+    elif risk_profile_match:
+        return "Risk Profile Questionnaire"
+    else:
+        logging.debug(f"Unrecognized form fields: {fields}")
+        return "Unknown"
+
+def validate_fais(fields):
+    required_fields = ['Signature1', 'Signature2', 'Signature3', '@Date1', '@Date2', '@Date3']
+    missing_fields = []
+
+    for field in required_fields:
+        matched_field = next((f for f in fields if f['name'] == field), None)
+        if matched_field is None or matched_field['value'] is None:
+            # Include page number in the output and format name
+            page_num = next((f['page'] for f in fields if f['name'] == field), None)
+            formatted_name = field.replace('Signature', 'Signature ').replace('@Date', 'Date ') + (f" (page {page_num})" if page_num else "")
+            missing_fields.append(formatted_name)
+
+    return list(set(missing_fields))
+
+def validate_risk_profile(fields):
     field_groups = {
-        "Your investment term is": ['Investment Term', 'Investment Term2', 'Investment Term3', 'Investment Term4', 'Investment Term5'],
-        "Required risk": ['Required Risk 1', 'Required Risk 2', 'Required Risk 3'],
-        "Risk tolerance": ['Risk Tolerance 1', 'Risk Tolerance 2', 'Risk Tolerance 3'],
-        "Risk capacity": ['Risk Category 1', 'Risk Category 2', 'Risk Category 3'],
-        "Score outcome": ['Risk outcome 1', 'Risk outcome 2', 'Risk outcome 3', 'Risk outcome 4', 'Risk outcome 5']
+        "Investment Term": ['Investment Term', 'Investment Term2', 'Investment Term3', 'Investment Term4', 'Investment Term5'],
+        "Required Risk": ['Required Risk 1', 'Required Risk 2', 'Required Risk 3'],
+        "Risk Tolerance": ['Risk Tolerance 1', 'Risk Tolerance 2', 'Risk Tolerance 3'],
+        "Risk Capacity": ['Risk Category 1', 'Risk Category 2', 'Risk Category 3'],
+        "Score Outcome": ['Risk outcome 1', 'Risk outcome 2', 'Risk outcome 3', 'Risk outcome 4', 'Risk outcome 5']
     }
 
     required_fields = [
         'Prepared for', 'Identity number', 'Financial Adviser', 'Prepared on', 'TOTAL SCORE',
-        'Your derived profile according to this Risk Questionnaire is', 'Date', 'If you disagree please state the chosen risk profile and the reason for this risk profile' 
-        #, 'Signature of client'
+        'Your derived profile according to this Risk Questionnaire is', 'Date', 'If you disagree please state the chosen risk profile and the reason for this risk profile'
     ]
 
     missing_fields = []
@@ -63,33 +98,7 @@ def identify_and_validate_form(fields, signatures):
         if matched_field is None or matched_field['value'] is None:
             missing_fields.append(field)
 
-    logging.debug(f"All extracted fields: {fields}")
-    logging.debug(f"Missing fields: {missing_fields}")
-
-    return form_type, list(set(missing_fields))
-
-def extract_signature_image(pdf_path, page_num, signature_coords):
-    reader = PdfReader(pdf_path)
-    page = reader.pages[page_num]
-    x, y, width, height = signature_coords
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_img:
-        temp_img_name = temp_img.name
-        # Placeholder: Use correct method to extract image from PDF
-        # pdf2image.convert_from_path(pdf_path)[page_num].crop((x, y, x + width, y + height)).save(temp_img_name)
-        logging.debug(f"Extracted signature image to: {temp_img_name}")
-
-    return temp_img_name
-
-def detect_handwritten_signature(image_path):
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    _, thresh = cv2.threshold(image, 150, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    has_signature = bool(contours)
-    logging.debug(f"Handwritten signature detected: {has_signature}")
-
-    return has_signature
+    return list(set(missing_fields))
 
 @app.route('/api/v1/upload', methods=['POST'])
 def upload_file():
@@ -105,12 +114,15 @@ def upload_file():
 
     try:
         fields, signatures = extract_pdf_fields(temp_file.name)
-        form_type, missing_fields = identify_and_validate_form(fields, signatures)
+        form_type = identify_form(fields)
 
-        if 'Signature of client' in missing_fields:
-            signature_image_path = extract_signature_image(temp_file.name, page_num=0, signature_coords=(100, 100, 200, 50))  # Example coordinates
-            if detect_handwritten_signature(signature_image_path):
-                missing_fields.remove('Signature of client')
+        if form_type == "FAIS Letter":
+            missing_fields = validate_fais(fields)
+        elif form_type == "Risk Profile Questionnaire":
+            missing_fields = validate_risk_profile(fields)
+        else:
+            missing_fields = ["Unknown form type"]
+
     except Exception as e:
         logging.error(f"Error processing file: {e}")
         return jsonify({"error": f"Internal server error: {e}"}), 500
